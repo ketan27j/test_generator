@@ -1,9 +1,3 @@
-# examples/basic_usage.py
-"""
-Basic usage examples for Web Page Analyzer
-This file demonstrates how to get started with the analyzer
-"""
-
 import os
 import sys
 import time
