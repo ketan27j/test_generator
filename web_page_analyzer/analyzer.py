@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Web Action Analyzer - Capture browser actions and generate automation tests
-Designed for BrowserStack integration
-"""
-
 import json
 import time
 import tkinter as tk
@@ -20,7 +14,7 @@ import threading
 import queue
 import re
 from typing import List, Dict, Any
-import openai  # You'll need to install: pip install openai
+from google import genai 
 from dataclasses import dataclass
 
 
@@ -122,8 +116,9 @@ class LLMAnalyzer:
     def __init__(self, api_key: str = None):
         self.api_key = api_key
         if api_key:
-            openai.api_key = api_key
-    
+            client = genai.Client(api_key=api_key)
+            self.client = client
+
     def analyze_action(self, action: ActionRecord) -> str:
         """Convert action to natural language description"""
         if not self.api_key:
@@ -143,14 +138,13 @@ class LLMAnalyzer:
             Focus on user intent and business logic rather than technical details.
             """
             
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.3
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                messages=prompt,
             )
             
-            return response.choices[0].message.content.strip()
+            # return response.choices[0].message.content.strip()
+            return response.text.strip()
         except Exception as e:
             print(f"LLM Analysis failed: {e}")
             return self._fallback_analysis(action)
