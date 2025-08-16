@@ -16,6 +16,7 @@ import re
 from typing import List, Dict, Any
 from google import genai 
 from dataclasses import dataclass
+import os
 
 
 @dataclass
@@ -143,7 +144,6 @@ class LLMAnalyzer:
                 messages=prompt,
             )
             
-            # return response.choices[0].message.content.strip()
             return response.text.strip()
         except Exception as e:
             print(f"LLM Analysis failed: {e}")
@@ -222,6 +222,9 @@ class ActionRecorder:
         self.is_recording = False
         self.action_queue = queue.Queue()
         self.screenshot_counter = 0
+        self.processed_actions = set()  # Track processed action IDs to prevent duplicates
+        self.last_url = ""
+        self.last_input_values = {}  # Track last input values to prevent duplicate input events
     
     def setup_driver(self, browser_type="chrome"):
         """Initialize WebDriver"""
@@ -235,65 +238,129 @@ class ActionRecorder:
                 self.driver = webdriver.Chrome(options=options)
                 self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            # Inject JavaScript to monitor actions
-            self._inject_monitoring_script()
             return True
         except Exception as e:
             print(f"Driver setup failed: {e}")
             return False
     
     def _inject_monitoring_script(self):
-        """Inject JavaScript to monitor user interactions"""
+        """Inject JavaScript to monitor user interactions - FIXED to prevent duplicates"""
         monitoring_script = """
-        window.recordedActions = [];
+        // Remove existing listeners if they exist to prevent duplicates
+        if (window.actionRecorderCleanup) {
+            window.actionRecorderCleanup();
+        }
         
-        // Monitor clicks
-        document.addEventListener('click', function(event) {
+        // Initialize the recordedActions array and action counter
+        window.recordedActions = [];
+        window.actionCounter = 0;
+        window.lastInputTime = {};
+        
+        // Create cleanup function
+        window.actionRecorderCleanup = function() {
+            // This will be populated with cleanup functions
+        };
+        
+        // Debounce function to prevent rapid duplicate events
+        function debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        }
+        
+        // Function to create unique action ID
+        function createActionId(type, element) {
+            return type + '_' + (element.id || element.tagName) + '_' + Date.now();
+        }
+        
+        // Monitor clicks with deduplication
+        const clickHandler = function(event) {
+            // Skip if this is a programmatic click or already processed
+            if (event.isTrusted === false) return;
+            
+            const actionId = createActionId('click', event.target);
             window.recordedActions.push({
                 type: 'click',
                 element: event.target,
                 timestamp: Date.now(),
                 x: event.clientX,
-                y: event.clientY
+                y: event.clientY,
+                actionId: actionId
             });
-        }, true);
+        };
         
-        // Monitor input changes
-        document.addEventListener('input', function(event) {
+        // Monitor input changes with debouncing and deduplication
+        const inputHandler = debounce(function(event) {
             if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
+                const elementKey = event.target.id || event.target.name || event.target.tagName;
+                const currentValue = event.target.value;
+                
+                // Skip if value hasn't changed significantly
+                if (window.lastInputTime[elementKey] === currentValue) {
+                    return;
+                }
+                
+                window.lastInputTime[elementKey] = currentValue;
+                
+                const actionId = createActionId('input', event.target);
                 window.recordedActions.push({
                     type: 'input',
                     element: event.target,
-                    value: event.target.value,
-                    timestamp: Date.now()
+                    value: currentValue,
+                    timestamp: Date.now(),
+                    actionId: actionId
                 });
             }
-        }, true);
+        }, 500); // 500ms debounce
         
         // Monitor form submissions
-        document.addEventListener('submit', function(event) {
+        const submitHandler = function(event) {
+            const actionId = createActionId('submit', event.target);
             window.recordedActions.push({
                 type: 'submit',
                 element: event.target,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                actionId: actionId
             });
-        }, true);
+        };
         
-        // Monitor navigation
+        // Add event listeners
+        document.addEventListener('click', clickHandler, true);
+        document.addEventListener('input', inputHandler, true);
+        document.addEventListener('submit', submitHandler, true);
+        
+        // Store cleanup function
+        window.actionRecorderCleanup = function() {
+            document.removeEventListener('click', clickHandler, true);
+            document.removeEventListener('input', inputHandler, true);
+            document.removeEventListener('submit', submitHandler, true);
+        };
+        
+        // Monitor navigation (simplified to avoid duplicates)
         let currentUrl = location.href;
-        setInterval(function() {
+        window.navigationCheckInterval = setInterval(function() {
             if (location.href !== currentUrl) {
                 window.recordedActions.push({
                     type: 'navigate',
                     url: location.href,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    actionId: 'navigate_' + Date.now()
                 });
                 currentUrl = location.href;
             }
         }, 1000);
         """
         
-        self.driver.execute_script(monitoring_script)
+        try:
+            self.driver.execute_script(monitoring_script)
+        except Exception as e:
+            print(f"Failed to inject monitoring script: {e}")
     
     def start_recording(self):
         """Start recording actions"""
@@ -302,6 +369,12 @@ class ActionRecorder:
         
         self.is_recording = True
         self.actions = []
+        self.processed_actions = set()  # Reset processed actions
+        self.last_input_values = {}  # Reset input tracking
+        
+        # Inject monitoring script
+        self._inject_monitoring_script()
+        self.last_url = self.driver.current_url
         
         # Start monitoring thread
         self.monitoring_thread = threading.Thread(target=self._monitor_actions)
@@ -313,26 +386,92 @@ class ActionRecorder:
     def stop_recording(self):
         """Stop recording actions"""
         self.is_recording = False
+        
+        # Clean up JavaScript listeners
+        try:
+            self.driver.execute_script("""
+                if (window.actionRecorderCleanup) {
+                    window.actionRecorderCleanup();
+                }
+                if (window.navigationCheckInterval) {
+                    clearInterval(window.navigationCheckInterval);
+                }
+            """)
+        except:
+            pass
+        
         time.sleep(1)  # Wait for last actions to be captured
         return self.actions
     
     def _monitor_actions(self):
-        """Monitor and capture actions in background thread"""
+        """Monitor and capture actions in background thread - FIXED to prevent duplicates"""
         while self.is_recording:
             try:
-                # Get actions from JavaScript
-                js_actions = self.driver.execute_script("return window.recordedActions.splice(0);")
+                # Get actions from JavaScript with safety check
+                js_actions = self.driver.execute_script("""
+                    if (window.recordedActions && Array.isArray(window.recordedActions)) {
+                        var actions = window.recordedActions.splice(0);  // Get all and clear
+                        return actions;
+                    }
+                    return [];
+                """)
                 
-                for js_action in js_actions:
-                    action_record = self._create_action_record(js_action)
-                    if action_record:
-                        self.actions.append(action_record)
-                        self.action_queue.put(action_record)
+                if js_actions:
+                    for js_action in js_actions:
+                        # Check for duplicate actions using actionId or timestamp + type combination
+                        action_key = js_action.get('actionId') or f"{js_action['type']}_{js_action['timestamp']}"
+                        
+                        if action_key not in self.processed_actions:
+                            # Additional deduplication for input events
+                            if js_action['type'] == 'input':
+                                element_key = self._get_element_key(js_action)
+                                current_value = js_action.get('value', '')
+                                
+                                # Skip if same input value was just recorded
+                                if (element_key in self.last_input_values and 
+                                    self.last_input_values[element_key] == current_value):
+                                    continue
+                                
+                                self.last_input_values[element_key] = current_value
+                            
+                            # Additional deduplication for navigation
+                            elif js_action['type'] == 'navigate':
+                                new_url = js_action.get('url', '')
+                                if new_url == self.last_url:
+                                    continue
+                                self.last_url = new_url
+                            
+                            action_record = self._create_action_record(js_action)
+                            if action_record:
+                                self.actions.append(action_record)
+                                self.action_queue.put(action_record)
+                                self.processed_actions.add(action_key)
                 
-                time.sleep(0.5)  # Check every 500ms
+                time.sleep(1)  # Increased interval to reduce monitoring frequency
             except Exception as e:
                 print(f"Monitoring error: {e}")
-                break
+                # Try to reinject the script if there's an error
+                try:
+                    self._inject_monitoring_script()
+                except:
+                    pass
+                time.sleep(2)  # Wait longer before retrying
+    
+    def _get_element_key(self, js_action):
+        """Generate a unique key for an element to track duplicates"""
+        element = js_action.get('element')
+        if not element:
+            return str(js_action.get('timestamp', ''))
+        
+        try:
+            element_data = self.driver.execute_script("""
+                var elem = arguments[0];
+                if (!elem) return '';
+                return (elem.id || '') + '_' + (elem.name || '') + '_' + elem.tagName;
+            """, element)
+            return element_data or str(js_action.get('timestamp', ''))
+        except:
+            return str(js_action.get('timestamp', ''))
     
     def _create_action_record(self, js_action) -> ActionRecord:
         """Create ActionRecord from JavaScript action data"""
@@ -352,37 +491,66 @@ class ActionRecorder:
                 )
             
             # For other actions, find the element
-            element = js_action['element']
-            element_obj = self.driver.execute_script("return arguments[0];", element)
+            element = js_action.get('element')
+            if not element:
+                return None
+                
+            # Use JavaScript to get element properties safely
+            element_data = self.driver.execute_script("""
+                var elem = arguments[0];
+                if (!elem || !elem.tagName) return null;
+                
+                try {
+                    return {
+                        tagName: elem.tagName,
+                        text: elem.textContent ? elem.textContent.trim().substring(0, 100) : '',
+                        id: elem.id || '',
+                        className: elem.className || '',
+                        name: elem.name || '',
+                        type: elem.type || '',
+                        value: elem.value || '',
+                        href: elem.href || ''
+                    };
+                } catch (e) {
+                    return null;
+                }
+            """, element)
             
-            if not element_obj:
+            if not element_data or not element_data.get('tagName'):
                 return None
             
-            # Generate XPath
-            xpath = XPathGenerator.generate_xpath(element_obj)
+            # Create a WebElement for XPath generation
+            try:
+                element_obj = self.driver.execute_script("return arguments[0];", element)
+                if not element_obj:
+                    return None
+                
+                # Generate XPath
+                xpath = XPathGenerator.generate_xpath(element_obj)
+            except Exception as e:
+                print(f"XPath generation error: {e}")
+                xpath = f"//{element_data['tagName'].lower()}"
             
-            # Get element details
-            tag_name = element_obj.tag_name
-            text = element_obj.text.strip() if element_obj.text else ''
-            
+            # Prepare attributes
             attributes = {}
-            for attr in ['id', 'class', 'name', 'type', 'value', 'href']:
-                value = element_obj.get_attribute(attr)
+            for attr in ['id', 'className', 'name', 'type', 'value', 'href']:
+                value = element_data.get(attr, '')
                 if value:
                     attributes[attr] = value
             
-            # Take screenshot for this action
-            screenshot_path = self._take_screenshot()
+            # Take screenshot for this action (optional, can be resource intensive)
+            screenshot_path = None  # Disable screenshots for now to improve performance
+            # screenshot_path = self._take_screenshot()
             
             return ActionRecord(
                 timestamp=timestamp,
                 action_type=js_action['type'],
                 element_xpath=xpath,
-                element_text=text,
-                element_tag=tag_name,
+                element_text=element_data['text'],
+                element_tag=element_data['tagName'].lower(),
                 element_attributes=attributes,
                 page_url=self.driver.current_url,
-                description=f"{js_action['type']} on {tag_name}",
+                description=f"{js_action['type']} on {element_data['tagName'].lower()}",
                 screenshot_path=screenshot_path
             )
             
@@ -396,19 +564,45 @@ class ActionRecorder:
             self.screenshot_counter += 1
             filename = f"screenshot_{self.screenshot_counter}_{int(time.time())}.png"
             screenshot_path = f"screenshots/{filename}"
+            
+            # Ensure screenshots directory exists
+            os.makedirs("screenshots", exist_ok=True)
+            
             self.driver.save_screenshot(screenshot_path)
             return screenshot_path
-        except:
+        except Exception as e:
+            print(f"Screenshot error: {e}")
             return None
     
     def navigate_to(self, url: str):
         """Navigate to a specific URL"""
         if self.driver:
-            self.driver.get(url)
+            try:
+                self.driver.get(url)
+                # Update last URL to prevent duplicate navigation records
+                self.last_url = url
+                # Reinject monitoring script after navigation
+                time.sleep(2)  # Wait for page to load
+                if self.is_recording:
+                    self._inject_monitoring_script()
+            except Exception as e:
+                print(f"Navigation error: {e}")
     
     def cleanup(self):
         """Clean up resources"""
         if self.driver:
+            try:
+                # Clean up JavaScript listeners
+                self.driver.execute_script("""
+                    if (window.actionRecorderCleanup) {
+                        window.actionRecorderCleanup();
+                    }
+                    if (window.navigationCheckInterval) {
+                        clearInterval(window.navigationCheckInterval);
+                    }
+                """)
+            except:
+                pass
             self.driver.quit()
 
 
@@ -426,9 +620,7 @@ class WebActionAnalyzerGUI:
         self.setup_gui()
         
         # Create screenshots directory
-        import os
-        if not os.path.exists("screenshots"):
-            os.makedirs("screenshots")
+        os.makedirs("screenshots", exist_ok=True)
     
     def setup_gui(self):
         """Setup the GUI components"""
@@ -457,13 +649,17 @@ class WebActionAnalyzerGUI:
         config_frame = ttk.LabelFrame(parent, text="Configuration")
         config_frame.pack(fill='x', padx=5, pady=5)
         
-        ttk.Label(config_frame, text="OpenAI API Key:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        ttk.Label(config_frame, text="Gemini API Key:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
         self.api_key_entry = ttk.Entry(config_frame, show='*', width=50)
+        # Get API key from environment variable or use default
+        api_key = os.getenv('GEMINI_API_KEY', '')
+        if api_key:
+            self.api_key_entry.insert(0, api_key.strip())
         self.api_key_entry.grid(row=0, column=1, padx=5, pady=5)
         
         ttk.Label(config_frame, text="Start URL:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
         self.url_entry = ttk.Entry(config_frame, width=50)
-        self.url_entry.insert(0, "https://example.com")
+        self.url_entry.insert(0, "https://solalerter.cryptoconsulting.tech")
         self.url_entry.grid(row=1, column=1, padx=5, pady=5)
         
         # Control buttons
@@ -577,7 +773,7 @@ class WebActionAnalyzerGUI:
     def stop_recording(self):
         """Stop recording actions"""
         actions = self.recorder.stop_recording()
-        self.log_message(f"Recording stopped! Captured {len(actions)} actions.")
+        self.log_message(f"Recording stopped! Captured {len(actions)} unique actions.")
         
         self.start_button.config(state='normal')
         self.stop_button.config(state='disabled')
@@ -595,7 +791,7 @@ class WebActionAnalyzerGUI:
                 pass
             
             # Schedule next check
-            self.root.after(500, self.monitor_actions)
+            self.root.after(1000, self.monitor_actions)  # Increased interval to reduce GUI updates
     
     def update_actions_display(self, actions):
         """Update the actions tree view"""
@@ -755,10 +951,18 @@ class WebActionAnalyzerGUI:
     def run(self):
         """Run the application"""
         try:
+            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
             self.root.mainloop()
         finally:
             # Cleanup
             self.recorder.cleanup()
+    
+    def on_closing(self):
+        """Handle application closing"""
+        if self.recorder.is_recording:
+            self.recorder.stop_recording()
+        self.recorder.cleanup()
+        self.root.destroy()
 
 
 def main():
