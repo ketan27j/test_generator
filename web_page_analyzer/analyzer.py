@@ -17,6 +17,7 @@ from typing import List, Dict, Any
 from google import genai 
 from dataclasses import dataclass
 import os
+from lxml import html, etree
 
 
 @dataclass
@@ -56,6 +57,14 @@ class XPathGenerator:
         if name:
             xpaths.append(f"//{tag_name}[@name='{name}']")
         
+        # Generate relative XPath
+        try:
+            relative_xpath = XPathGenerator._generate_relative_xpath(element)
+            if relative_xpath:
+                xpaths.append(relative_xpath)
+        except:
+            pass
+
         # Class-based XPath
         if class_name:
             classes = class_name.split()
@@ -71,44 +80,68 @@ class XPathGenerator:
             xpaths.append(f"//{tag_name}[text()='{text}']")
             xpaths.append(f"//{tag_name}[contains(text(), '{text[:20]}')]")
         
-        # Generate relative XPath
-        try:
-            relative_xpath = XPathGenerator._generate_relative_xpath(element)
-            if relative_xpath:
-                xpaths.append(relative_xpath)
-        except:
-            pass
+
         
         return xpaths[0] if xpaths else f"//{tag_name}"
     
     @staticmethod
     def _generate_relative_xpath(element):
         """Generate relative XPath based on element hierarchy"""
-        driver = element._parent
-        script = """
-        function getXPath(element) {
-            if (element.id !== '') {
-                return "//*[@id='" + element.id + "']";
-            }
-            if (element === document.body) {
-                return '/html/body';
-            }
+        # driver = element._parent
+        # script = """
+        # function getXPath(element) {
+        #     if (element.id !== '') {
+        #         return "//*[@id='" + element.id + "']";
+        #     }
+        #     if (element === document.body) {
+        #         return '/html/body';
+        #     }
             
-            var ix = 0;
-            var siblings = element.parentNode.childNodes;
-            for (var i = 0; i < siblings.length; i++) {
-                var sibling = siblings[i];
-                if (sibling === element) {
-                    return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
-                }
-                if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
-                    ix++;
-                }
-            }
-        }
-        return getXPath(arguments[0]);
-        """
-        return driver.execute_script(script, element)
+        #     var ix = 0;
+        #     var siblings = element.parentNode.childNodes;
+        #     for (var i = 0; i < siblings.length; i++) {
+        #         var sibling = siblings[i];
+        #         if (sibling === element) {
+        #             return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
+        #         }
+        #         if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
+        #             ix++;
+        #         }
+        #     }
+        # }
+        # return getXPath(arguments[0]);
+        # """
+        # return driver.execute_script(script, element)
+        components = []
+        child = element if element.name else element.parent
+        
+        for parent in child.parents:
+            if parent.name is None:
+                continue
+                
+            # Build selector with attributes
+            selector = child.name
+            
+            # Add id if present
+            if child.get('id'):
+                selector += f'[@id="{child.get("id")}"]'
+            # Add class if present and no id
+            elif child.get('class'):
+                classes = ' '.join(child.get('class'))
+                selector += f'[@class="{classes}"]'
+            else:
+                # Use position if no unique attributes
+                siblings = parent.find_all(child.name, recursive=False)
+                if len(siblings) > 1:
+                    index = siblings.index(child) + 1
+                    selector += f'[{index}]'
+            
+            components.append(selector)
+            child = parent
+        
+        components.reverse()
+        return '/' + '/'.join(components) if components else '/'
+
 
 
 class LLMAnalyzer:
