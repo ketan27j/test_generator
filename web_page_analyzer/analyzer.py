@@ -1,1008 +1,633 @@
-import json
-import time
+# Web Action Analyzer Tool
+# A comprehensive tool to track browser actions and analyze webpage changes
+
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+import threading
+import time
+import json
+import hashlib
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-import threading
-import queue
-import re
-from typing import List, Dict, Any
-from google import genai 
-from dataclasses import dataclass
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from bs4 import BeautifulSoup
+import difflib
 import os
-from lxml import html, etree
 
-
-@dataclass
-class ActionRecord:
-    """Data class to store captured actions"""
-    timestamp: str
-    action_type: str
-    element_xpath: str
-    element_text: str
-    element_tag: str
-    element_attributes: dict
-    page_url: str
-    description: str
-    screenshot_path: str = None
-
-
-class XPathGenerator:
-    """Utility class to generate robust XPath selectors"""
-    
-    @staticmethod
-    def generate_xpath(element):
-        """Generate multiple XPath options for an element"""
-        xpaths = []
-        
-        # Get element attributes
-        tag_name = element.tag_name
-        element_id = element.get_attribute('id')
-        class_name = element.get_attribute('class')
-        name = element.get_attribute('name')
-        text = element.text.strip() if element.text else ''
-        
-        # ID-based XPath (most reliable)
-        if element_id:
-            xpaths.append(f"//*[@id='{element_id}']")
-        
-        # Name-based XPath
-        if name:
-            xpaths.append(f"//{tag_name}[@name='{name}']")
-        
-        # Generate relative XPath
-        try:
-            relative_xpath = XPathGenerator._generate_relative_xpath(element)
-            if relative_xpath:
-                xpaths.append(relative_xpath)
-        except:
-            pass
-
-        # Class-based XPath
-        if class_name:
-            classes = class_name.split()
-            if len(classes) == 1:
-                xpaths.append(f"//{tag_name}[@class='{class_name}']")
-            else:
-                # Use contains for multiple classes
-                class_conditions = " and ".join([f"contains(@class, '{cls}')" for cls in classes])
-                xpaths.append(f"//{tag_name}[{class_conditions}]")
-        
-        # Text-based XPath
-        if text and len(text) < 50:
-            xpaths.append(f"//{tag_name}[text()='{text}']")
-            xpaths.append(f"//{tag_name}[contains(text(), '{text[:20]}')]")
-        
-
-        
-        return xpaths[0] if xpaths else f"//{tag_name}"
-    
-    @staticmethod
-    def _generate_relative_xpath(element):
-        """Generate relative XPath based on element hierarchy"""
-        # driver = element._parent
-        # script = """
-        # function getXPath(element) {
-        #     if (element.id !== '') {
-        #         return "//*[@id='" + element.id + "']";
-        #     }
-        #     if (element === document.body) {
-        #         return '/html/body';
-        #     }
-            
-        #     var ix = 0;
-        #     var siblings = element.parentNode.childNodes;
-        #     for (var i = 0; i < siblings.length; i++) {
-        #         var sibling = siblings[i];
-        #         if (sibling === element) {
-        #             return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
-        #         }
-        #         if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
-        #             ix++;
-        #         }
-        #     }
-        # }
-        # return getXPath(arguments[0]);
-        # """
-        # return driver.execute_script(script, element)
-        components = []
-        child = element if element.name else element.parent
-        
-        for parent in child.parents:
-            if parent.name is None:
-                continue
-                
-            # Build selector with attributes
-            selector = child.name
-            
-            # Add id if present
-            if child.get('id'):
-                selector += f'[@id="{child.get("id")}"]'
-            # Add class if present and no id
-            elif child.get('class'):
-                classes = ' '.join(child.get('class'))
-                selector += f'[@class="{classes}"]'
-            else:
-                # Use position if no unique attributes
-                siblings = parent.find_all(child.name, recursive=False)
-                if len(siblings) > 1:
-                    index = siblings.index(child) + 1
-                    selector += f'[{index}]'
-            
-            components.append(selector)
-            child = parent
-        
-        components.reverse()
-        return '/' + '/'.join(components) if components else '/'
-
-
-
-class LLMAnalyzer:
-    """Analyze captured actions using LLM and convert to natural language"""
-    
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key
-        if api_key:
-            client = genai.Client(api_key=api_key)
-            self.client = client
-
-    def analyze_action(self, action: ActionRecord) -> str:
-        """Convert action to natural language description"""
-        if not self.api_key:
-            return self._fallback_analysis(action)
-        
-        try:
-            prompt = f"""
-            Convert this web browser action to natural language for test documentation:
-            
-            Action Type: {action.action_type}
-            Element: {action.element_tag} with text "{action.element_text}"
-            XPath: {action.element_xpath}
-            URL: {action.page_url}
-            Attributes: {json.dumps(action.element_attributes, indent=2)}
-            
-            Provide a clear, concise description suitable for automation testing documentation.
-            Focus on user intent and business logic rather than technical details.
-            """
-            
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
-                messages=prompt,
-            )
-            
-            return response.text.strip()
-        except Exception as e:
-            print(f"LLM Analysis failed: {e}")
-            return self._fallback_analysis(action)
-    
-    def _fallback_analysis(self, action: ActionRecord) -> str:
-        """Fallback analysis without LLM"""
-        if action.action_type == 'click':
-            if action.element_text:
-                return f"Click on '{action.element_text}' button/link"
-            else:
-                return f"Click on {action.element_tag} element"
-        elif action.action_type == 'input':
-            return f"Enter text in {action.element_text or action.element_tag} field"
-        elif action.action_type == 'navigate':
-            return f"Navigate to {action.page_url}"
-        elif action.action_type == 'scroll':
-            return "Scroll page"
-        else:
-            return f"Perform {action.action_type} action"
-    
-    def generate_test_script(self, actions: List[ActionRecord]) -> str:
-        """Generate complete test script from actions"""
-        script_lines = [
-            "from selenium import webdriver",
-            "from selenium.webdriver.common.by import By",
-            "from selenium.webdriver.support.ui import WebDriverWait",
-            "from selenium.webdriver.support import expected_conditions as EC",
-            "import time",
-            "",
-            "def test_recorded_actions():",
-            "    \"\"\"Generated test case from recorded actions\"\"\"",
-            "    driver = webdriver.Chrome()",
-            "    wait = WebDriverWait(driver, 10)",
-            "    ",
-            "    try:"
-        ]
-        
-        for i, action in enumerate(actions):
-            comment = f"        # Step {i+1}: {self.analyze_action(action)}"
-            script_lines.append(comment)
-            
-            if action.action_type == 'navigate':
-                script_lines.append(f"        driver.get('{action.page_url}')")
-            elif action.action_type == 'click':
-                script_lines.append(f"        element = wait.until(EC.element_to_be_clickable((By.XPATH, \"{action.element_xpath}\")))")
-                script_lines.append("        element.click()")
-            elif action.action_type == 'input':
-                script_lines.append(f"        element = wait.until(EC.presence_of_element_located((By.XPATH, \"{action.element_xpath}\")))")
-                script_lines.append("        element.clear()")
-                script_lines.append(f"        element.send_keys('TEST_INPUT')")  # Placeholder
-            
-            script_lines.append("        time.sleep(1)")
-            script_lines.append("")
-        
-        script_lines.extend([
-            "    except Exception as e:",
-            "        print(f'Test failed: {e}')",
-            "        raise",
-            "    finally:",
-            "        driver.quit()",
-            "",
-            "if __name__ == '__main__':",
-            "    test_recorded_actions()"
-        ])
-        
-        return "\n".join(script_lines)
-
-
-class ActionRecorder:
-    """Core class to record browser actions"""
-    
+class WebActionAnalyzer:
     def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Web Action Analyzer")
+        self.root.geometry("1200x800")
+        
+        # Browser and tracking variables
         self.driver = None
-        self.actions = []
-        self.is_recording = False
-        self.action_queue = queue.Queue()
-        self.screenshot_counter = 0
-        self.processed_actions = set()  # Track processed action IDs to prevent duplicates
-        self.last_url = ""
-        self.last_input_values = {}  # Track last input values to prevent duplicate input events
-    
-    def setup_driver(self, browser_type="chrome"):
-        """Initialize WebDriver"""
+        self.is_monitoring = False
+        self.previous_state = {}
+        self.action_log = []
+        self.current_url = ""
+        
+        # Setup GUI
+        self.setup_gui()
+        
+    def setup_gui(self):
+        """Setup the main GUI interface"""
+        # Create main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(4, weight=1)
+        
+        # URL input section
+        ttk.Label(main_frame, text="Website URL:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.url_var = tk.StringVar(value="https://example.com")
+        url_entry = ttk.Entry(main_frame, textvariable=self.url_var, width=50)
+        url_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        
+        # Control buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=1, column=0, columnspan=2, pady=10)
+        
+        self.start_btn = ttk.Button(button_frame, text="Start Monitoring", command=self.start_monitoring)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(button_frame, text="Stop Monitoring", command=self.stop_monitoring, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.refresh_btn = ttk.Button(button_frame, text="Force Refresh Check", command=self.check_for_changes, state=tk.DISABLED)
+        self.refresh_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.save_btn = ttk.Button(button_frame, text="Save Log", command=self.save_log)
+        self.save_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.clear_btn = ttk.Button(button_frame, text="Clear Log", command=self.clear_log)
+        self.clear_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Settings frame
+        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding="5")
+        settings_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # Monitoring interval
+        ttk.Label(settings_frame, text="Check Interval (seconds):").pack(side=tk.LEFT)
+        self.interval_var = tk.StringVar(value="2")
+        interval_spinbox = ttk.Spinbox(settings_frame, from_=1, to=30, width=5, textvariable=self.interval_var)
+        interval_spinbox.pack(side=tk.LEFT, padx=5)
+        
+        # Headless mode
+        self.headless_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_frame, text="Headless Mode", variable=self.headless_var).pack(side=tk.LEFT, padx=20)
+        
+        # Auto-save
+        self.autosave_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(settings_frame, text="Auto-save on changes", variable=self.autosave_var).pack(side=tk.LEFT, padx=20)
+        
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready to start monitoring...")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # Log display with tabs
+        notebook = ttk.Notebook(main_frame)
+        notebook.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        # Action log tab
+        log_frame = ttk.Frame(notebook)
+        notebook.add(log_frame, text="Action Log")
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=20)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Changes tab
+        changes_frame = ttk.Frame(notebook)
+        notebook.add(changes_frame, text="Detected Changes")
+        
+        self.changes_text = scrolledtext.ScrolledText(changes_frame, wrap=tk.WORD, height=20)
+        self.changes_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # XPath finder tab
+        xpath_frame = ttk.Frame(notebook)
+        notebook.add(xpath_frame, text="XPath Finder")
+        
+        ttk.Label(xpath_frame, text="Click on elements in the browser to get their XPath:").pack(anchor=tk.W, padx=5, pady=5)
+        self.xpath_text = scrolledtext.ScrolledText(xpath_frame, wrap=tk.WORD, height=15)
+        self.xpath_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+    def start_monitoring(self):
+        """Start the web monitoring process"""
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Please enter a valid URL")
+            return
+            
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+            self.url_var.set(url)
+        
         try:
-            if browser_type == "chrome":
-                options = Options()
-                options.add_argument("--disable-blink-features=AutomationControlled")
-                options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                options.add_experimental_option('useAutomationExtension', False)
-                
-                self.driver = webdriver.Chrome(options=options)
-                self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            self.setup_driver()
+            self.driver.get(url)
+            self.current_url = url
             
-            return True
+            # Store initial state
+            self.previous_state = self.capture_page_state()
+            
+            # Update GUI
+            self.is_monitoring = True
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+            self.refresh_btn.config(state=tk.NORMAL)
+            
+            self.log_action("SYSTEM", f"Started monitoring: {url}")
+            self.status_var.set("Monitoring active...")
+            
+            # Start monitoring thread
+            self.monitoring_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+            self.monitoring_thread.start()
+            
+            # Setup click tracking
+            self.setup_click_tracking()
+            
         except Exception as e:
-            print(f"Driver setup failed: {e}")
-            return False
+            messagebox.showerror("Error", f"Failed to start monitoring: {str(e)}")
+            self.stop_monitoring()
     
-    def _inject_monitoring_script(self):
-        """Inject JavaScript to monitor user interactions - FIXED to prevent duplicates"""
-        monitoring_script = """
-        // Remove existing listeners if they exist to prevent duplicates
-        if (window.actionRecorderCleanup) {
-            window.actionRecorderCleanup();
-        }
+    def setup_driver(self):
+        """Setup Chrome WebDriver with options"""
+        chrome_options = Options()
+        if self.headless_var.get():
+            chrome_options.add_argument("--headless")
         
-        // Initialize the recordedActions array and action counter
-        window.recordedActions = [];
-        window.actionCounter = 0;
-        window.lastInputTime = {};
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
         
-        // Create cleanup function
-        window.actionRecorderCleanup = function() {
-            // This will be populated with cleanup functions
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.implicitly_wait(10)
+        except Exception as e:
+            raise Exception(f"Chrome driver not found. Please install ChromeDriver: {str(e)}")
+    
+    def setup_click_tracking(self):
+        """Inject JavaScript to track clicks and interactions"""
+        click_script = """
+        window.actionTracker = {
+            actions: [],
+            addAction: function(action) {
+                this.actions.push(action);
+            }
         };
         
-        // Debounce function to prevent rapid duplicate events
-        function debounce(func, wait) {
-            let timeout;
-            return function executedFunction(...args) {
-                const later = () => {
-                    clearTimeout(timeout);
-                    func(...args);
-                };
-                clearTimeout(timeout);
-                timeout = setTimeout(later, wait);
+        // Track clicks
+        document.addEventListener('click', function(e) {
+            var xpath = getXPath(e.target);
+            var action = {
+                type: 'CLICK',
+                element: e.target.tagName + (e.target.id ? '#' + e.target.id : '') + 
+                        (e.target.className ? '.' + e.target.className.replace(/\s+/g, '.') : ''),
+                xpath: xpath,
+                text: e.target.textContent ? e.target.textContent.slice(0, 50) : '',
+                timestamp: new Date().toISOString()
             };
-        }
+            window.actionTracker.addAction(action);
+        });
         
-        // Function to create unique action ID
-        function createActionId(type, element) {
-            return type + '_' + (element.id || element.tagName) + '_' + Date.now();
-        }
+        // Track form inputs
+        document.addEventListener('input', function(e) {
+            if (e.target.type !== 'password') {
+                var xpath = getXPath(e.target);
+                var action = {
+                    type: 'INPUT',
+                    element: e.target.tagName + (e.target.id ? '#' + e.target.id : '') + 
+                            (e.target.className ? '.' + e.target.className.replace(/\s+/g, '.') : ''),
+                    xpath: xpath,
+                    value: e.target.value.slice(0, 20) + (e.target.value.length > 20 ? '...' : ''),
+                    timestamp: new Date().toISOString()
+                };
+                window.actionTracker.addAction(action);
+            }
+        });
         
-        // Monitor clicks with deduplication
-        const clickHandler = function(event) {
-            // Skip if this is a programmatic click or already processed
-            if (event.isTrusted === false) return;
+        // XPath generator function
+        function getXPath(element) {
+            if (element.id) {
+                return '//*[@id="' + element.id + '"]';
+            }
             
-            const actionId = createActionId('click', event.target);
-            window.recordedActions.push({
-                type: 'click',
-                element: event.target,
-                timestamp: Date.now(),
-                x: event.clientX,
-                y: event.clientY,
-                actionId: actionId
-            });
-        };
-        
-        // Monitor input changes with debouncing and deduplication
-        const inputHandler = debounce(function(event) {
-            if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
-                const elementKey = event.target.id || event.target.name || event.target.tagName;
-                const currentValue = event.target.value;
+            var xpath = '';
+            while (element && element.nodeType === 1) {
+                var index = 0;
+                var siblings = element.parentNode ? element.parentNode.children : [];
                 
-                // Skip if value hasn't changed significantly
-                if (window.lastInputTime[elementKey] === currentValue) {
-                    return;
+                for (var i = 0; i < siblings.length; i++) {
+                    var sibling = siblings[i];
+                    if (sibling === element) {
+                        xpath = '/' + element.tagName.toLowerCase() + '[' + (index + 1) + ']' + xpath;
+                        break;
+                    }
+                    if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
+                        index++;
+                    }
                 }
-                
-                window.lastInputTime[elementKey] = currentValue;
-                
-                const actionId = createActionId('input', event.target);
-                window.recordedActions.push({
-                    type: 'input',
-                    element: event.target,
-                    value: currentValue,
-                    timestamp: Date.now(),
-                    actionId: actionId
-                });
+                element = element.parentNode;
             }
-        }, 500); // 500ms debounce
-        
-        // Monitor form submissions
-        const submitHandler = function(event) {
-            const actionId = createActionId('submit', event.target);
-            window.recordedActions.push({
-                type: 'submit',
-                element: event.target,
-                timestamp: Date.now(),
-                actionId: actionId
-            });
-        };
-        
-        // Add event listeners
-        document.addEventListener('click', clickHandler, true);
-        document.addEventListener('input', inputHandler, true);
-        document.addEventListener('submit', submitHandler, true);
-        
-        // Store cleanup function
-        window.actionRecorderCleanup = function() {
-            document.removeEventListener('click', clickHandler, true);
-            document.removeEventListener('input', inputHandler, true);
-            document.removeEventListener('submit', submitHandler, true);
-        };
-        
-        // Monitor navigation (simplified to avoid duplicates)
-        let currentUrl = location.href;
-        window.navigationCheckInterval = setInterval(function() {
-            if (location.href !== currentUrl) {
-                window.recordedActions.push({
-                    type: 'navigate',
-                    url: location.href,
-                    timestamp: Date.now(),
-                    actionId: 'navigate_' + Date.now()
-                });
-                currentUrl = location.href;
-            }
-        }, 1000);
+            return xpath;
+        }
         """
         
         try:
-            self.driver.execute_script(monitoring_script)
+            self.driver.execute_script(click_script)
         except Exception as e:
-            print(f"Failed to inject monitoring script: {e}")
+            self.log_action("ERROR", f"Failed to setup click tracking: {str(e)}")
     
-    def start_recording(self):
-        """Start recording actions"""
+    def monitor_loop(self):
+        """Main monitoring loop running in separate thread"""
+        while self.is_monitoring:
+            try:
+                time.sleep(float(self.interval_var.get()))
+                
+                if not self.is_monitoring:
+                    break
+                
+                # Check for user actions
+                self.check_user_actions()
+                
+                # Check for page changes
+                self.check_for_changes()
+                
+            except Exception as e:
+                self.log_action("ERROR", f"Monitoring error: {str(e)}")
+                time.sleep(5)  # Wait before retrying
+    
+    def check_user_actions(self):
+        """Check for user actions tracked by JavaScript"""
+        try:
+            actions = self.driver.execute_script("return window.actionTracker ? window.actionTracker.actions.splice(0) : [];")
+            
+            for action in actions:
+                self.log_user_action(action)
+                
+        except Exception as e:
+            pass  # Silently handle JavaScript errors
+    
+    def log_user_action(self, action):
+        """Log user action with XPath information"""
+        action_type = action.get('type', 'UNKNOWN')
+        element = action.get('element', 'Unknown element')
+        xpath = action.get('xpath', 'No XPath')
+        
+        if action_type == 'CLICK':
+            text = action.get('text', '').strip()
+            description = f"Clicked on {element}"
+            if text:
+                description += f" with text '{text[:30]}...'" if len(text) > 30 else f" with text '{text}'"
+        elif action_type == 'INPUT':
+            value = action.get('value', '')
+            description = f"Entered text in {element}: '{value}'"
+        else:
+            description = f"{action_type} on {element}"
+        
+        self.log_action(action_type, description, xpath)
+    
+    def check_for_changes(self):
+        """Check for changes in the webpage"""
         if not self.driver:
-            return False
-        
-        self.is_recording = True
-        self.actions = []
-        self.processed_actions = set()  # Reset processed actions
-        self.last_input_values = {}  # Reset input tracking
-        
-        # Inject monitoring script
-        self._inject_monitoring_script()
-        self.last_url = self.driver.current_url
-        
-        # Start monitoring thread
-        self.monitoring_thread = threading.Thread(target=self._monitor_actions)
-        self.monitoring_thread.daemon = True
-        self.monitoring_thread.start()
-        
-        return True
-    
-    def stop_recording(self):
-        """Stop recording actions"""
-        self.is_recording = False
-        
-        # Clean up JavaScript listeners
+            return
+            
         try:
-            self.driver.execute_script("""
-                if (window.actionRecorderCleanup) {
-                    window.actionRecorderCleanup();
-                }
-                if (window.navigationCheckInterval) {
-                    clearInterval(window.navigationCheckInterval);
-                }
-            """)
-        except:
-            pass
-        
-        time.sleep(1)  # Wait for last actions to be captured
-        return self.actions
+            current_state = self.capture_page_state()
+            changes = self.compare_states(self.previous_state, current_state)
+            
+            if changes:
+                self.log_action("CHANGE", f"Detected {len(changes)} page changes")
+                self.log_changes(changes)
+                self.previous_state = current_state
+                
+                if self.autosave_var.get():
+                    self.auto_save_log()
+            
+            # Check for URL changes (navigation)
+            current_url = self.driver.current_url
+            if current_url != self.current_url:
+                self.log_action("NAVIGATION", f"Page navigated from {self.current_url} to {current_url}")
+                self.current_url = current_url
+                self.previous_state = current_state  # Reset state on navigation
+                
+        except Exception as e:
+            self.log_action("ERROR", f"Error checking for changes: {str(e)}")
     
-    def _monitor_actions(self):
-        """Monitor and capture actions in background thread - FIXED to prevent duplicates"""
-        while self.is_recording:
-            try:
-                # Get actions from JavaScript with safety check
-                js_actions = self.driver.execute_script("""
-                    if (window.recordedActions && Array.isArray(window.recordedActions)) {
-                        var actions = window.recordedActions.splice(0);  // Get all and clear
-                        return actions;
+    def capture_page_state(self):
+        """Capture current state of the webpage"""
+        try:
+            # Get page source and basic info
+            html = self.driver.page_source
+            title = self.driver.title
+            url = self.driver.current_url
+            
+            # Parse HTML with BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Extract key elements with their XPaths
+            elements = {}
+            
+            # Find all interactive elements
+            interactive_tags = ['a', 'button', 'input', 'select', 'textarea', 'form']
+            for tag in interactive_tags:
+                for i, element in enumerate(soup.find_all(tag)):
+                    key = f"{tag}_{i}"
+                    elements[key] = {
+                        'tag': tag,
+                        'text': element.get_text().strip()[:100],
+                        'attrs': dict(element.attrs),
+                        'xpath': self.generate_xpath_for_element(element, soup)
                     }
-                    return [];
-                """)
-                
-                if js_actions:
-                    for js_action in js_actions:
-                        # Check for duplicate actions using actionId or timestamp + type combination
-                        action_key = js_action.get('actionId') or f"{js_action['type']}_{js_action['timestamp']}"
-                        
-                        if action_key not in self.processed_actions:
-                            # Additional deduplication for input events
-                            if js_action['type'] == 'input':
-                                element_key = self._get_element_key(js_action)
-                                current_value = js_action.get('value', '')
-                                
-                                # Skip if same input value was just recorded
-                                if (element_key in self.last_input_values and 
-                                    self.last_input_values[element_key] == current_value):
-                                    continue
-                                
-                                self.last_input_values[element_key] = current_value
-                            
-                            # Additional deduplication for navigation
-                            elif js_action['type'] == 'navigate':
-                                new_url = js_action.get('url', '')
-                                if new_url == self.last_url:
-                                    continue
-                                self.last_url = new_url
-                            
-                            action_record = self._create_action_record(js_action)
-                            if action_record:
-                                self.actions.append(action_record)
-                                self.action_queue.put(action_record)
-                                self.processed_actions.add(action_key)
-                
-                time.sleep(1)  # Increased interval to reduce monitoring frequency
-            except Exception as e:
-                print(f"Monitoring error: {e}")
-                # Try to reinject the script if there's an error
-                try:
-                    self._inject_monitoring_script()
-                except:
-                    pass
-                time.sleep(2)  # Wait longer before retrying
-    
-    def _get_element_key(self, js_action):
-        """Generate a unique key for an element to track duplicates"""
-        element = js_action.get('element')
-        if not element:
-            return str(js_action.get('timestamp', ''))
-        
-        try:
-            element_data = self.driver.execute_script("""
-                var elem = arguments[0];
-                if (!elem) return '';
-                return (elem.id || '') + '_' + (elem.name || '') + '_' + elem.tagName;
-            """, element)
-            return element_data or str(js_action.get('timestamp', ''))
-        except:
-            return str(js_action.get('timestamp', ''))
-    
-    def _create_action_record(self, js_action) -> ActionRecord:
-        """Create ActionRecord from JavaScript action data"""
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            if js_action['type'] == 'navigate':
-                return ActionRecord(
-                    timestamp=timestamp,
-                    action_type='navigate',
-                    element_xpath='',
-                    element_text='',
-                    element_tag='',
-                    element_attributes={},
-                    page_url=js_action['url'],
-                    description=f"Navigated to {js_action['url']}"
-                )
+            # Create content hash for change detection
+            content_hash = hashlib.md5(html.encode()).hexdigest()
             
-            # For other actions, find the element
-            element = js_action.get('element')
-            if not element:
-                return None
-                
-            # Use JavaScript to get element properties safely
-            element_data = self.driver.execute_script("""
-                var elem = arguments[0];
-                if (!elem || !elem.tagName) return null;
-                
-                try {
-                    return {
-                        tagName: elem.tagName,
-                        text: elem.textContent ? elem.textContent.trim().substring(0, 100) : '',
-                        id: elem.id || '',
-                        className: elem.className || '',
-                        name: elem.name || '',
-                        type: elem.type || '',
-                        value: elem.value || '',
-                        href: elem.href || ''
-                    };
-                } catch (e) {
-                    return null;
-                }
-            """, element)
-            
-            if not element_data or not element_data.get('tagName'):
-                return None
-            
-            # Create a WebElement for XPath generation
-            try:
-                element_obj = self.driver.execute_script("return arguments[0];", element)
-                if not element_obj:
-                    return None
-                
-                # Generate XPath
-                xpath = XPathGenerator.generate_xpath(element_obj)
-            except Exception as e:
-                print(f"XPath generation error: {e}")
-                xpath = f"//{element_data['tagName'].lower()}"
-            
-            # Prepare attributes
-            attributes = {}
-            for attr in ['id', 'className', 'name', 'type', 'value', 'href']:
-                value = element_data.get(attr, '')
-                if value:
-                    attributes[attr] = value
-            
-            # Take screenshot for this action (optional, can be resource intensive)
-            screenshot_path = None  # Disable screenshots for now to improve performance
-            # screenshot_path = self._take_screenshot()
-            
-            return ActionRecord(
-                timestamp=timestamp,
-                action_type=js_action['type'],
-                element_xpath=xpath,
-                element_text=element_data['text'],
-                element_tag=element_data['tagName'].lower(),
-                element_attributes=attributes,
-                page_url=self.driver.current_url,
-                description=f"{js_action['type']} on {element_data['tagName'].lower()}",
-                screenshot_path=screenshot_path
-            )
+            return {
+                'html': html,
+                'title': title,
+                'url': url,
+                'content_hash': content_hash,
+                'elements': elements,
+                'timestamp': datetime.now().isoformat()
+            }
             
         except Exception as e:
-            print(f"Error creating action record: {e}")
-            return None
+            self.log_action("ERROR", f"Error capturing page state: {str(e)}")
+            return {}
     
-    def _take_screenshot(self) -> str:
-        """Take screenshot for the current action"""
+    def generate_xpath_for_element(self, element, soup):
+        """Generate XPath for a BeautifulSoup element"""
         try:
-            self.screenshot_counter += 1
-            filename = f"screenshot_{self.screenshot_counter}_{int(time.time())}.png"
-            screenshot_path = f"screenshots/{filename}"
+            if element.get('id'):
+                return f'//*[@id="{element["id"]}"]'
             
-            # Ensure screenshots directory exists
-            os.makedirs("screenshots", exist_ok=True)
+            path_parts = []
+            current = element
             
-            self.driver.save_screenshot(screenshot_path)
-            return screenshot_path
-        except Exception as e:
-            print(f"Screenshot error: {e}")
-            return None
+            while current and current.name:
+                siblings = [s for s in current.parent.children if hasattr(s, 'name') and s.name == current.name] if current.parent else [current]
+                if len(siblings) > 1:
+                    index = siblings.index(current) + 1
+                    path_parts.append(f"{current.name}[{index}]")
+                else:
+                    path_parts.append(current.name)
+                current = current.parent
+            
+            return '/' + '/'.join(reversed(path_parts)) if path_parts else '//*'
+            
+        except:
+            return '//*'
     
-    def navigate_to(self, url: str):
-        """Navigate to a specific URL"""
+    def compare_states(self, old_state, new_state):
+        """Compare two page states and return list of changes"""
+        if not old_state or not new_state:
+            return []
+        
+        changes = []
+        
+        # Check for content changes
+        if old_state.get('content_hash') != new_state.get('content_hash'):
+            changes.append({
+                'type': 'CONTENT_CHANGE',
+                'description': 'Page content has changed',
+                'old_hash': old_state.get('content_hash'),
+                'new_hash': new_state.get('content_hash')
+            })
+        
+        # Check for title changes
+        if old_state.get('title') != new_state.get('title'):
+            changes.append({
+                'type': 'TITLE_CHANGE',
+                'description': f'Title changed from "{old_state.get("title")}" to "{new_state.get("title")}"'
+            })
+        
+        # Check for element changes
+        old_elements = old_state.get('elements', {})
+        new_elements = new_state.get('elements', {})
+        
+        # Find removed elements
+        for key in old_elements:
+            if key not in new_elements:
+                element = old_elements[key]
+                changes.append({
+                    'type': 'ELEMENT_REMOVED',
+                    'description': f'{element["tag"].upper()} element removed',
+                    'xpath': element.get('xpath', 'No XPath'),
+                    'text': element.get('text', '')
+                })
+        
+        # Find added elements
+        for key in new_elements:
+            if key not in old_elements:
+                element = new_elements[key]
+                changes.append({
+                    'type': 'ELEMENT_ADDED',
+                    'description': f'{element["tag"].upper()} element added',
+                    'xpath': element.get('xpath', 'No XPath'),
+                    'text': element.get('text', '')
+                })
+        
+        # Find modified elements
+        for key in set(old_elements.keys()) & set(new_elements.keys()):
+            old_elem = old_elements[key]
+            new_elem = new_elements[key]
+            
+            if old_elem.get('text') != new_elem.get('text'):
+                changes.append({
+                    'type': 'ELEMENT_MODIFIED',
+                    'description': f'{new_elem["tag"].upper()} element text changed',
+                    'xpath': new_elem.get('xpath', 'No XPath'),
+                    'old_text': old_elem.get('text', ''),
+                    'new_text': new_elem.get('text', '')
+                })
+        
+        return changes
+    
+    def log_action(self, action_type, description, xpath=""):
+        """Log an action to the display"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {action_type}: {description}"
+        
+        if xpath:
+            log_entry += f"\n    XPath: {xpath}"
+        
+        log_entry += "\n" + "-" * 80 + "\n"
+        
+        # Update GUI in main thread
+        self.root.after(0, self._update_log_display, log_entry)
+        
+        # Store in memory
+        self.action_log.append({
+            'timestamp': timestamp,
+            'type': action_type,
+            'description': description,
+            'xpath': xpath
+        })
+    
+    def log_changes(self, changes):
+        """Log detected changes to the changes tab"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        change_text = f"[{timestamp}] CHANGES DETECTED:\n"
+        
+        for i, change in enumerate(changes, 1):
+            change_text += f"\n{i}. {change['type']}: {change['description']}"
+            if 'xpath' in change:
+                change_text += f"\n   XPath: {change['xpath']}"
+            if 'text' in change and change['text']:
+                change_text += f"\n   Text: {change['text'][:100]}..."
+            change_text += "\n"
+        
+        change_text += "\n" + "=" * 80 + "\n"
+        
+        # Update changes display in main thread
+        self.root.after(0, self._update_changes_display, change_text)
+    
+    def _update_log_display(self, text):
+        """Update log display (called from main thread)"""
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+    
+    def _update_changes_display(self, text):
+        """Update changes display (called from main thread)"""
+        self.changes_text.insert(tk.END, text)
+        self.changes_text.see(tk.END)
+    
+    def stop_monitoring(self):
+        """Stop the monitoring process"""
+        self.is_monitoring = False
+        
         if self.driver:
             try:
-                self.driver.get(url)
-                # Update last URL to prevent duplicate navigation records
-                self.last_url = url
-                # Reinject monitoring script after navigation
-                time.sleep(2)  # Wait for page to load
-                if self.is_recording:
-                    self._inject_monitoring_script()
-            except Exception as e:
-                print(f"Navigation error: {e}")
-    
-    def cleanup(self):
-        """Clean up resources"""
-        if self.driver:
-            try:
-                # Clean up JavaScript listeners
-                self.driver.execute_script("""
-                    if (window.actionRecorderCleanup) {
-                        window.actionRecorderCleanup();
-                    }
-                    if (window.navigationCheckInterval) {
-                        clearInterval(window.navigationCheckInterval);
-                    }
-                """)
+                self.driver.quit()
             except:
                 pass
-            self.driver.quit()
-
-
-class WebActionAnalyzerGUI:
-    """Main GUI application"""
+            self.driver = None
+        
+        # Update GUI
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.refresh_btn.config(state=tk.DISABLED)
+        
+        self.status_var.set("Monitoring stopped.")
+        self.log_action("SYSTEM", "Monitoring stopped")
     
-    def __init__(self):
-        self.recorder = ActionRecorder()
-        self.llm_analyzer = None  # Will be initialized with API key
-        
-        self.root = tk.Tk()
-        self.root.title("Web Action Analyzer - BrowserStack Integration")
-        self.root.geometry("1200x800")
-        
-        self.setup_gui()
-        
-        # Create screenshots directory
-        os.makedirs("screenshots", exist_ok=True)
-    
-    def setup_gui(self):
-        """Setup the GUI components"""
-        # Create notebook for tabs
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Recording tab
-        recording_frame = ttk.Frame(notebook)
-        notebook.add(recording_frame, text="Recording")
-        self.setup_recording_tab(recording_frame)
-        
-        # Analysis tab
-        analysis_frame = ttk.Frame(notebook)
-        notebook.add(analysis_frame, text="Analysis")
-        self.setup_analysis_tab(analysis_frame)
-        
-        # Export tab
-        export_frame = ttk.Frame(notebook)
-        notebook.add(export_frame, text="Export")
-        self.setup_export_tab(export_frame)
-    
-    def setup_recording_tab(self, parent):
-        """Setup recording controls"""
-        # Configuration frame
-        config_frame = ttk.LabelFrame(parent, text="Configuration")
-        config_frame.pack(fill='x', padx=5, pady=5)
-        
-        ttk.Label(config_frame, text="Gemini API Key:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
-        self.api_key_entry = ttk.Entry(config_frame, show='*', width=50)
-        # Get API key from environment variable or use default
-        api_key = os.getenv('GEMINI_API_KEY', '')
-        if api_key:
-            self.api_key_entry.insert(0, api_key.strip())
-        self.api_key_entry.grid(row=0, column=1, padx=5, pady=5)
-        
-        ttk.Label(config_frame, text="Start URL:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
-        self.url_entry = ttk.Entry(config_frame, width=50)
-        self.url_entry.insert(0, "https://solalerter.cryptoconsulting.tech")
-        self.url_entry.grid(row=1, column=1, padx=5, pady=5)
-        
-        # Control buttons
-        control_frame = ttk.LabelFrame(parent, text="Recording Controls")
-        control_frame.pack(fill='x', padx=5, pady=5)
-        
-        self.setup_button = ttk.Button(control_frame, text="Setup Browser", command=self.setup_browser)
-        self.setup_button.pack(side='left', padx=5, pady=5)
-        
-        self.start_button = ttk.Button(control_frame, text="Start Recording", command=self.start_recording, state='disabled')
-        self.start_button.pack(side='left', padx=5, pady=5)
-        
-        self.stop_button = ttk.Button(control_frame, text="Stop Recording", command=self.stop_recording, state='disabled')
-        self.stop_button.pack(side='left', padx=5, pady=5)
-        
-        self.navigate_button = ttk.Button(control_frame, text="Navigate to URL", command=self.navigate_to_url, state='disabled')
-        self.navigate_button.pack(side='left', padx=5, pady=5)
-        
-        # Status display
-        status_frame = ttk.LabelFrame(parent, text="Status")
-        status_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        self.status_text = scrolledtext.ScrolledText(status_frame, height=15)
-        self.status_text.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        self.log_message("Web Action Analyzer initialized. Configure settings and click 'Setup Browser' to begin.")
-    
-    def setup_analysis_tab(self, parent):
-        """Setup analysis display"""
-        # Actions list
-        actions_frame = ttk.LabelFrame(parent, text="Captured Actions")
-        actions_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # Treeview for actions
-        columns = ('Timestamp', 'Action', 'Element', 'XPath', 'Description')
-        self.actions_tree = ttk.Treeview(actions_frame, columns=columns, show='headings', height=20)
-        
-        for col in columns:
-            self.actions_tree.heading(col, text=col)
-            self.actions_tree.column(col, width=150)
-        
-        scrollbar = ttk.Scrollbar(actions_frame, orient='vertical', command=self.actions_tree.yview)
-        self.actions_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.actions_tree.pack(side='left', fill='both', expand=True, padx=5, pady=5)
-        scrollbar.pack(side='right', fill='y')
-        
-        # Analysis button
-        analyze_button = ttk.Button(actions_frame, text="Analyze with LLM", command=self.analyze_actions)
-        analyze_button.pack(pady=5)
-    
-    def setup_export_tab(self, parent):
-        """Setup export options"""
-        export_frame = ttk.LabelFrame(parent, text="Export Options")
-        export_frame.pack(fill='x', padx=5, pady=5)
-        
-        ttk.Button(export_frame, text="Export as JSON", command=self.export_json).pack(side='left', padx=5, pady=5)
-        ttk.Button(export_frame, text="Export as Test Script", command=self.export_test_script).pack(side='left', padx=5, pady=5)
-        ttk.Button(export_frame, text="Export Report", command=self.export_report).pack(side='left', padx=5, pady=5)
-        
-        # Preview
-        preview_frame = ttk.LabelFrame(parent, text="Export Preview")
-        preview_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        self.export_preview = scrolledtext.ScrolledText(preview_frame)
-        self.export_preview.pack(fill='both', expand=True, padx=5, pady=5)
-    
-    def log_message(self, message):
-        """Add message to status log"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.status_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.status_text.see(tk.END)
-        self.root.update_idletasks()
-    
-    def setup_browser(self):
-        """Setup browser driver"""
-        self.log_message("Setting up browser driver...")
-        
-        if self.recorder.setup_driver():
-            self.log_message("Browser driver setup successful!")
-            self.start_button.config(state='normal')
-            self.navigate_button.config(state='normal')
-            
-            # Initialize LLM analyzer if API key provided
-            api_key = self.api_key_entry.get().strip()
-            if api_key:
-                self.llm_analyzer = LLMAnalyzer(api_key)
-                self.log_message("LLM analyzer initialized with API key.")
-            else:
-                self.log_message("No API key provided - using fallback analysis.")
-        else:
-            self.log_message("Failed to setup browser driver. Check ChromeDriver installation.")
-    
-    def navigate_to_url(self):
-        """Navigate to specified URL"""
-        url = self.url_entry.get().strip()
-        if url:
-            self.recorder.navigate_to(url)
-            self.log_message(f"Navigated to: {url}")
-    
-    def start_recording(self):
-        """Start recording actions"""
-        if self.recorder.start_recording():
-            self.log_message("Recording started! Perform actions in the browser window.")
-            self.start_button.config(state='disabled')
-            self.stop_button.config(state='normal')
-            
-            # Start action monitoring in GUI
-            self.monitor_actions()
-    
-    def stop_recording(self):
-        """Stop recording actions"""
-        actions = self.recorder.stop_recording()
-        self.log_message(f"Recording stopped! Captured {len(actions)} unique actions.")
-        
-        self.start_button.config(state='normal')
-        self.stop_button.config(state='disabled')
-        
-        self.update_actions_display(actions)
-    
-    def monitor_actions(self):
-        """Monitor actions during recording"""
-        if self.recorder.is_recording:
-            try:
-                while not self.recorder.action_queue.empty():
-                    action = self.recorder.action_queue.get_nowait()
-                    self.log_message(f"Captured: {action.action_type} - {action.description}")
-            except queue.Empty:
-                pass
-            
-            # Schedule next check
-            self.root.after(1000, self.monitor_actions)  # Increased interval to reduce GUI updates
-    
-    def update_actions_display(self, actions):
-        """Update the actions tree view"""
-        # Clear existing items
-        for item in self.actions_tree.get_children():
-            self.actions_tree.delete(item)
-        
-        # Add new actions
-        for action in actions:
-            self.actions_tree.insert('', 'end', values=(
-                action.timestamp,
-                action.action_type,
-                f"{action.element_tag}: {action.element_text[:30]}...",
-                action.element_xpath[:50] + "..." if len(action.element_xpath) > 50 else action.element_xpath,
-                action.description[:50] + "..." if len(action.description) > 50 else action.description
-            ))
-    
-    def analyze_actions(self):
-        """Analyze captured actions with LLM"""
-        if not self.recorder.actions:
-            messagebox.showwarning("No Actions", "No actions to analyze. Please record some actions first.")
+    def save_log(self):
+        """Save the action log to a file"""
+        if not self.action_log:
+            messagebox.showwarning("Warning", "No actions logged yet.")
             return
-        
-        if not self.llm_analyzer:
-            self.llm_analyzer = LLMAnalyzer()  # Use fallback analysis
-        
-        self.log_message("Analyzing actions with LLM...")
-        
-        # Analyze each action
-        for action in self.recorder.actions:
-            enhanced_description = self.llm_analyzer.analyze_action(action)
-            action.description = enhanced_description
-        
-        # Update display
-        self.update_actions_display(self.recorder.actions)
-        self.log_message("Analysis complete!")
-    
-    def export_json(self):
-        """Export actions as JSON"""
-        if not self.recorder.actions:
-            messagebox.showwarning("No Data", "No actions to export.")
-            return
-        
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-        )
-        
-        if filename:
-            export_data = []
-            for action in self.recorder.actions:
-                export_data.append({
-                    'timestamp': action.timestamp,
-                    'action_type': action.action_type,
-                    'element_xpath': action.element_xpath,
-                    'element_text': action.element_text,
-                    'element_tag': action.element_tag,
-                    'element_attributes': action.element_attributes,
-                    'page_url': action.page_url,
-                    'description': action.description,
-                    'screenshot_path': action.screenshot_path
-                })
-            
-            with open(filename, 'w') as f:
-                json.dump(export_data, f, indent=2)
-            
-            self.log_message(f"Exported JSON to: {filename}")
-    
-    def export_test_script(self):
-        """Export actions as test script"""
-        if not self.recorder.actions:
-            messagebox.showwarning("No Data", "No actions to export.")
-            return
-        
-        if not self.llm_analyzer:
-            self.llm_analyzer = LLMAnalyzer()
-        
-        script_content = self.llm_analyzer.generate_test_script(self.recorder.actions)
-        
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".py",
-            filetypes=[("Python files", "*.py"), ("All files", "*.*")]
-        )
-        
-        if filename:
-            with open(filename, 'w') as f:
-                f.write(script_content)
-            
-            self.log_message(f"Exported test script to: {filename}")
-            
-            # Show preview
-            self.export_preview.delete(1.0, tk.END)
-            self.export_preview.insert(1.0, script_content)
-    
-    def export_report(self):
-        """Export detailed report"""
-        if not self.recorder.actions:
-            messagebox.showwarning("No Data", "No actions to export.")
-            return
-        
-        report_content = self._generate_report()
         
         filename = filedialog.asksaveasfilename(
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("All files", "*.*")],
+            title="Save Action Log"
         )
         
         if filename:
-            with open(filename, 'w') as f:
-                f.write(report_content)
-            
-            self.log_message(f"Exported report to: {filename}")
-            
-            # Show preview
-            self.export_preview.delete(1.0, tk.END)
-            self.export_preview.insert(1.0, report_content)
+            try:
+                if filename.endswith('.json'):
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        json.dump(self.action_log, f, indent=2, ensure_ascii=False)
+                else:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write("Web Action Analyzer Log\n")
+                        f.write("=" * 50 + "\n\n")
+                        
+                        for action in self.action_log:
+                            f.write(f"[{action['timestamp']}] {action['type']}: {action['description']}\n")
+                            if action.get('xpath'):
+                                f.write(f"    XPath: {action['xpath']}\n")
+                            f.write("-" * 80 + "\n")
+                
+                messagebox.showinfo("Success", f"Log saved to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save log: {str(e)}")
     
-    def _generate_report(self) -> str:
-        """Generate detailed test report"""
-        report_lines = [
-            "WEB ACTION ANALYSIS REPORT",
-            "=" * 50,
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Total Actions Captured: {len(self.recorder.actions)}",
-            "",
-            "SUMMARY:",
-            "--------"
-        ]
-        
-        # Action type summary
-        action_counts = {}
-        for action in self.recorder.actions:
-            action_counts[action.action_type] = action_counts.get(action.action_type, 0) + 1
-        
-        for action_type, count in action_counts.items():
-            report_lines.append(f"- {action_type.title()}: {count}")
-        
-        report_lines.extend([
-            "",
-            "DETAILED ACTIONS:",
-            "-" * 20
-        ])
-        
-        # Detailed action list
-        for i, action in enumerate(self.recorder.actions, 1):
-            report_lines.extend([
-                f"{i}. [{action.timestamp}] {action.action_type.upper()}",
-                f"   Description: {action.description}",
-                f"   Element: {action.element_tag} - '{action.element_text}'",
-                f"   XPath: {action.element_xpath}",
-                f"   URL: {action.page_url}",
-                ""
-            ])
-        
-        return "\n".join(report_lines)
+    def auto_save_log(self):
+        """Auto-save log with timestamp"""
+        if not self.action_log:
+            return
+            
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"web_action_log_{timestamp}.txt"
+            
+            # Create logs directory if it doesn't exist
+            if not os.path.exists("logs"):
+                os.makedirs("logs")
+            
+            filepath = os.path.join("logs", filename)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write("Web Action Analyzer Log\n")
+                f.write("=" * 50 + "\n\n")
+                
+                for action in self.action_log:
+                    f.write(f"[{action['timestamp']}] {action['type']}: {action['description']}\n")
+                    if action.get('xpath'):
+                        f.write(f"    XPath: {action['xpath']}\n")
+                    f.write("-" * 80 + "\n")
+            
+            self.status_var.set(f"Auto-saved to {filepath}")
+            
+        except Exception as e:
+            self.log_action("ERROR", f"Auto-save failed: {str(e)}")
+    
+    def clear_log(self):
+        """Clear the action log"""
+        if messagebox.askyesno("Confirm", "Clear all logged actions?"):
+            self.action_log.clear()
+            self.log_text.delete(1.0, tk.END)
+            self.changes_text.delete(1.0, tk.END)
+            self.xpath_text.delete(1.0, tk.END)
+            self.status_var.set("Log cleared.")
     
     def run(self):
-        """Run the application"""
-        try:
-            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-            self.root.mainloop()
-        finally:
-            # Cleanup
-            self.recorder.cleanup()
+        """Start the GUI application"""
+        # Add cleanup on window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Start the GUI loop
+        self.root.mainloop()
     
     def on_closing(self):
         """Handle application closing"""
-        if self.recorder.is_recording:
-            self.recorder.stop_recording()
-        self.recorder.cleanup()
-        self.root.destroy()
-
+        if self.is_monitoring:
+            if messagebox.askokcancel("Quit", "Monitoring is active. Do you want to quit?"):
+                self.stop_monitoring()
+                self.root.destroy()
+        else:
+            self.root.destroy()
 
 def main():
-    """Main entry point"""
-    app = WebActionAnalyzerGUI()
-    app.run()
-
+    """Main function to run the Web Action Analyzer"""
+    print("Web Action Analyzer")
+    print("===================")
+    print("This tool requires ChromeDriver to be installed.")
+    print("Download from: https://chromedriver.chromium.org/")
+    print("Make sure ChromeDriver is in your PATH or in the same directory as this script.")
+    print()
+    
+    try:
+        app = WebActionAnalyzer()
+        app.run()
+    except KeyboardInterrupt:
+        print("\nApplication interrupted by user.")
+    except Exception as e:
+        print(f"Application error: {str(e)}")
 
 if __name__ == "__main__":
     main()
